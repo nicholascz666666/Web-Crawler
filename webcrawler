@@ -1,0 +1,245 @@
+#!/usr/bin/env python3
+
+import argparse
+import socket
+import ssl
+import sys
+from html.parser import HTMLParser
+import email
+
+# description
+parser = argparse.ArgumentParser(description="A web crawler that looks for secret flags on fakebook")
+# positional arguments
+parser.add_argument("username", help="Username")
+parser.add_argument("password", nargs='+', help='Password')
+# optional arguments
+parser.add_argument("--verbose", "-v", action='store_true', dest="verbose", default=False,
+                    help="Print helpful debug information")
+args = parser.parse_args()
+
+# store credentials
+username = args.username
+password = args.password[0]
+flag_found = 0
+visited_site = []
+frontier = []
+session_cookie = ""
+
+
+# print/debug helper
+def debug_helper(message):
+    if args.verbose:
+        print(message)
+
+
+# setup connection
+sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+host = "fakebook.3700.network"
+port = 443
+sock.connect((host, port))
+
+# warp socket with ssl
+context = ssl.create_default_context()
+sock = context.wrap_socket(sock, server_hostname=host)
+
+
+# template from python doc
+class MyHTMLParser(HTMLParser):
+    flag = False
+
+    # implementing the abstract method
+    def error(self, message):
+        sys.stderr.write("HTML parser encountered an error, quitting")
+        exit(-1)
+
+    def handle_starttag(self, tag, attrs):
+        global flag_found
+
+        # parse the attributes into a library
+        attr_dict = {}
+        for attribute in attrs:
+            attr_dict[attribute[0]] = attribute[1]
+
+        # if there is a flag, increment the flag count and update the flag boolean
+        if tag == 'h2' and attr_dict.get('class') == 'secret_flag':
+            flag_found += 1
+            self.flag = True
+        # alternatively, if we get an "a" tag, check if it has been visited, if not add to the frontier list
+        elif tag == 'a':
+            href = attr_dict.get('href')
+            if href.startswith('/fakebook') and href not in visited_site:
+                frontier.append(href)
+                visited_site.append(href)
+
+    def handle_data(self, data):
+        global flag_found
+        # if handle_starttag detected a secret_flag, read it and print to stdout
+        if self.flag:
+            sys.stdout.write(data.replace("FLAG: ", "") + "\n")
+            self.flag = False
+
+            # if all secret flags are found, quit the program
+            if flag_found == 5:
+                exit(0)
+
+
+# logging into fake book
+def login():
+    # construct the login request
+    login_path = "/accounts/login/?next=/fakebook/"
+    request = ('GET {0} HTTP/1.1\n'
+               'Host: fakebook.3700.network\n'
+               'Connection: keep-alive\n\n').format(login_path)
+    # send the request
+    sock.sendall(request.encode())
+
+    received_info = fetch_http_packet()
+    if received_info["status-code"] != "200" and received_info["status-code"] != "302":
+        sys.stderr.write("Status code does not equal to 200 or 302 when logging in, quitting")
+        exit(0)
+
+    csrftoken = received_info["csrftoken"]
+
+    debug_helper(" > here is your token")
+    debug_helper(csrftoken)
+
+    # building http request
+    # http form which contains all credentials
+    request_form = 'username=' + username + '&password=' + password + '&csrfmiddlewaretoken=' + str(
+        csrftoken) + '&next=%2Ffakebook%2F'
+
+    # build the http header
+    r = 'POST /accounts/login/ HTTP/1.1 \n' + 'Host: fakebook.3700.network\n'
+    r += 'Cookie: csrftoken=' + csrftoken + ';\n'
+    r += 'Referer: https://fakebook.3700.network/accounts/login/\n'
+    r += 'Content-Type: application/x-www-form-urlencoded\n'
+    r += 'Connection: keep-alive\n'
+    r += 'Content-Length: ' + str(len(request_form)) + '\n\n'
+    r += request_form + '\n\n'
+
+    # send the post
+    sock.sendall(r.encode())
+
+    received_info = fetch_http_packet()
+
+    debug_helper(" > Already sent the post request here is output: ")
+    debug_helper(received_info)
+
+
+def fetch_http_packet():
+    global session_cookie
+    full_packet_received = False
+    received_data = ""
+    return_content = {"csrftoken": "", "session-id": "", "status-code": ""}
+
+    while not full_packet_received:
+        data = sock.recv(4096).decode()
+        received_data += data
+
+        # separator of header and body
+        separator = '\r\n\r\n'
+
+        # we received a separator, that means we have the header.
+        if separator in data:
+            header = received_data.split(separator)[0]
+            # split the header by row
+            header = header.split("\r\n")
+            if header[5] == "Connection: keep-alive":
+                return_content["connection-status"] = True
+            else:
+                return_content["connection-status"] = False
+
+            # handle http status code
+            return_content["status-code"] = header[0].split(" ")[1]
+            if return_content["status-code"] == "302":
+                href = header[6].split(" ")[1]
+                debug_helper("302 redirecting to " + href)
+                if href.startswith('/fakebook'):
+                    frontier.insert(0, href)
+                    if href not in visited_site:
+                        visited_site.append(href)
+
+            # ignore the GET / HTTP/1.1
+            header = header[1:]
+            header_parsed = {}
+
+            set_cookie = []
+
+            # TODO: there is better way to do this (BaseHTTPRequestHandler) but im lazy
+            for item in header:
+                parsed = item.split(': ')
+                # TODO: add set-cookie
+                if parsed[0] == "Set-Cookie":
+                    set_cookie.append(parsed[1])
+                else:
+                    header_parsed[parsed[0]] = parsed[1]
+
+            debug_helper("New header parsed")
+            debug_helper(set_cookie)
+
+            # read from the header
+            for item in set_cookie:
+                if "csrftoken" in item:
+                    return_content["csrftoken"] = item.split("=")[1]
+                elif "sessionid" in item:
+                    return_content["session-id"] = item.split("=")[1]
+                    session_cookie = return_content["session-id"].replace("; expires", "")
+
+            content_length = int(header_parsed["Content-Length"])
+
+            bytes_left = content_length - len(received_data)
+            # continue to receive data packet
+            while bytes_left > 0:
+                data = sock.recv(min(content_length, 4096))
+                received_data += data
+                received_data -= len(data)
+
+            full_packet_received = True
+            # get the http body
+            http_body = received_data.split(separator)[1].replace("\n\n\n", "", 1)
+            http_parser = MyHTMLParser()
+            http_parser.feed(http_body)
+
+    debug_helper(" > http packet received completely, here is the output information")
+    debug_helper(return_content)
+    debug_helper(received_data)
+    return return_content
+
+
+login()
+
+visited_site.append("/accounts/login/?next=/fakebook/")
+frontier.append("/")
+visited_site.append("/")
+
+while len(frontier) > 0:
+    path = frontier[0]
+
+    # send the post
+    request = ('GET {0} HTTP/1.1\n'
+               'Host: fakebook.3700.network\n'
+               'Cookie: sessionid=' + session_cookie + '\n'
+               'Connection: keep-alive\n\n').format(path)
+
+    # send the request
+    sock.sendall(request.encode())
+
+    received_info = fetch_http_packet()
+
+    if not received_info["connection-status"]:
+        # reattempt login
+        debug_helper("reattempting login")
+        # setup connection
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        host = "fakebook.3700.network"
+        port = 443
+        sock.connect((host, port))
+
+        # warp socket with ssl
+        context = ssl.create_default_context()
+        sock = context.wrap_socket(sock, server_hostname=host)
+        login()
+    else:
+        if received_info["status-code"] != "500":
+            frontier.remove(path)
+
